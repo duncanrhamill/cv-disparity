@@ -1,0 +1,28 @@
+[package]
+name = "cv-disparity"
+version = "0.1.0"
+authors = ["Duncan Hamill <duncanrhamill@googlemail.com>"]
+edition = "2018"
+
+[[bench]]
+name = "mcmanamon"
+path = "bench/mcmanamon.rs"
+harness = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cv_camstream = { path = "../cv-camstream" }#{git = "https://github.com/duncanrhamill/cv-camstream"}
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+image = "0.23.6"
+imageproc = "0.20.0"
+plotters = { version = "^0.2.15", optional = true }
+
+[dev-dependencies]
+minifb = "0.16"
+criterion = "0.3"
+
+[features]
+default = []
+statistics = ["plotters"]
