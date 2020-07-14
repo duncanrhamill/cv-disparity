@@ -46,6 +46,9 @@ fn gen_from_imgs() -> Result<(), Box<dyn std::error::Error>> {
     // let left = disp.pre_filter(&frame).left.to_dynamic_luma8().to_luma();
     let right = disp.compute(&frame)?.to_luma_normalised();
 
+    // Save the right hand image out
+    right.save("res/disp_maps/mcmanamon_simple_rocks.png")?;
+
     while window.is_open() && !window.is_key_down(Key::Escape) {
 
         for y in 0..(HEIGHT) {

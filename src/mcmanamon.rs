@@ -34,6 +34,22 @@ pub struct Params {
     pub correlation_window_size: (usize, usize)
 }
 
+/// Criterion tripple with total, left column and right column values.
+#[derive(Copy, Clone, Debug)]
+struct CritTripple {
+    total: f32,
+    left_col: f32,
+    right_col: f32
+}
+
+#[derive(Copy, Clone, Debug)]
+struct CritTrippleInfo {
+    tripple: CritTripple,
+    x: usize,
+    y: usize,
+    d: usize,
+}
+
 // -----------------------------------------------------------------------------------------------
 // IMPLEMENTATIONS
 // -----------------------------------------------------------------------------------------------
@@ -42,10 +58,10 @@ impl McManamon {
     /// Create a new instance of the algorithm with the given parameters.
     pub fn new(params: Params) -> Self {
         let semi_width: isize = (params.correlation_window_size.0 as isize - 1) / 2;
-        let corr_window_x_range = -semi_width..semi_width;
+        let corr_window_x_range = -semi_width..semi_width + 1;
 
         let semi_height: isize = (params.correlation_window_size.1 as isize - 1) / 2;
-        let corr_window_y_range = -semi_height..semi_height;
+        let corr_window_y_range = -semi_height..semi_height + 1;
         
         Self { 
             params,
@@ -55,20 +71,91 @@ impl McManamon {
     }
 
     /// Calculate the correlation criterion for the given position and disparity.
-    fn get_criterion(&self, frame: &StereoFrame, x: usize, y: usize, d: usize) -> f32 {
-        let mut acc = 0.0f32;
-        
+    fn get_criterion(&self, frame: &StereoFrame, x: usize, y: usize, d: usize) -> CritTripple {
+        let mut middle = 0.0f32;
+        let mut left_col = 0.0f32;
+        let mut right_col = 0.0f32;
+
         for j in self.corr_window_y_range.clone() {
             for i in self.corr_window_x_range.clone() {
                 let xi = (x as isize + i) as usize;
                 let yj = (y as isize + j) as usize;
-                acc += (
-                    frame.left.get(xi, yj) - frame.right.get(xi - d, yj)
-                ).abs();
+
+                if i == self.corr_window_x_range.start {
+                    left_col += (
+                        frame.left.get(xi, yj) - frame.right.get(xi - d, yj)
+                    ).abs();
+                }
+                else if i == self.corr_window_x_range.end - 1 {
+                    right_col += (
+                        frame.left.get(xi, yj) - frame.right.get(xi - d, yj)
+                    ).abs();
+                }
+                else {
+                    middle += (
+                        frame.left.get(xi, yj) - frame.right.get(xi - d, yj)
+                    ).abs();
+                }
             }
         }
 
-        acc
+        CritTripple {
+            total: middle + left_col + right_col,
+            left_col,
+            right_col
+        }
+    }
+
+    /// Calculate the correlation criterion tripple for the given position and disparity using the
+    /// optimised method.
+    fn get_criterion_fast(
+        &self, 
+        frame: &StereoFrame, 
+        x: usize, 
+        y: usize, 
+        d: usize, 
+        left_crit_tripple: CritTripple, 
+        below_right_col_crit: f32
+    ) -> CritTripple {
+        let mut new_crit = 0.0f32;
+        let mut left_col = 0.0f32;
+        let mut right_col = 0.0f32;
+        let old_crit = (
+            frame.left.get(
+                x + self.corr_window_x_range.end as usize - 1,
+                y + self.corr_window_y_range.end as usize
+            ) 
+            - frame.right.get(
+                x + self.corr_window_x_range.end as usize - 1 - d,
+                y + self.corr_window_y_range.end as usize
+            ) 
+        ).abs();
+
+        for j in self.corr_window_y_range.clone() {
+            let xi_left = (x as isize + self.corr_window_x_range.start) as usize;
+            let xi_right = (x as isize + self.corr_window_x_range.end - 1) as usize;
+            let yj = (y as isize + j) as usize;
+
+            left_col += (
+                frame.left.get(xi_left, yj) - frame.right.get(xi_left - d, yj)
+            ).abs();
+
+            right_col += (
+                frame.left.get(xi_right, yj) - frame.right.get(xi_right - d, yj)
+            ).abs();
+
+            if j == self.corr_window_y_range.start {
+                new_crit = right_col;
+            }
+        }
+
+        CritTripple {
+            total: left_crit_tripple.total - left_crit_tripple.left_col + below_right_col_crit 
+                + new_crit - old_crit,
+            left_col,
+            right_col
+        }
+
     }
 }
 
@@ -97,10 +184,19 @@ impl DisparityAlgorithm for McManamon {
         #[cfg(feature = "statistics")]
         let mut max_dyn_disp_history: Vec<(usize, usize)> = vec![(0, 0); frame.height() as usize];
 
+        // Counter for how many slow (0) and fast (1) criterion calcuations are made
+        #[cfg(feature = "statistics")]
+        let mut num_crit_assessments = (0, 0);
+
         // Variables to track maximum and minimum disparity within the map itself, not for range
         // adjustment. Initial values are swapped around so that they don't dominate the result.
         let mut min_disp = self.params.max_disparity as f32;
         let mut max_disp = self.params.min_disparity as f32;
+
+        // Vector for holding criterion values in the row below.
+        // Indexed as below_crits[x][d].unwrap()
+        let mut below_right_col_crits: Vec<Vec<Option<f32>>> = 
+            vec![vec![None; self.params.max_disparity]; frame.width() as usize];
 
         // Iterate through rows backwards
         for y in (
@@ -120,11 +216,27 @@ impl DisparityAlgorithm for McManamon {
             let mut min_disp_this_row = self.params.max_disparity as f32;
             let mut max_disp_this_row = self.params.min_disparity as f32;
 
+            // Vector to hold left column values for the previous window
+            let mut left_crits: Vec<Option<CritTripple>> = 
+                vec![None; self.params.max_disparity]; 
+
             for x in 
                 self.params.correlation_window_size.0 + max_dyn_disp
                 ..
                 (frame.width() as usize - self.params.correlation_window_size.0) 
             {
+
+                // Make copy of the crit array below this one and clear the original
+                let below_right_cols_copy = below_right_col_crits[x].clone();
+                for c in &mut below_right_col_crits[x] {
+                    *c = None;
+                }
+
+                // Make copy of the left crit values array and clear the original
+                let left_crits_copy = left_crits.clone();
+                for c in &mut left_crits {
+                    *c = None;
+                }
                 
                 // Vector of criterions
                 let mut crits: Vec<f32> = Vec::with_capacity(
@@ -133,7 +245,43 @@ impl DisparityAlgorithm for McManamon {
 
                 // Calculate criterion for each disparity
                 for d in min_dyn_disp..max_dyn_disp {
-                    crits.push(self.get_criterion(frame, x, y, d));
+                    let crit_tripple: CritTripple;
+
+                    // If bottom row or first pixel in row use slow method
+                    if left_crits_copy[d].is_none()
+                        ||
+                        below_right_cols_copy[d].is_none()
+                    {
+                        crit_tripple = self.get_criterion(frame, x, y, d);
+
+                        #[cfg(feature = "statistics")]
+                        {
+                            num_crit_assessments.0 += 1;
+                        }
+                    }
+                    // Otherwise use the fast method
+                    else {
+                        crit_tripple = self.get_criterion_fast(
+                            frame,
+                            x, y, d,
+                            left_crits_copy[d].unwrap(),
+                            below_right_cols_copy[d].unwrap()
+                        );
+
+                        #[cfg(feature = "statistics")]
+                        {
+                            num_crit_assessments.1 += 1;
+                        }
+                    }
+
+                    // Set left tripple
+                    left_crits[d] = Some(crit_tripple);
+                    
+                    // Set below value
+                    below_right_col_crits[x][d] = Some(crit_tripple.right_col);
+
+                    // Set total crit accumulator
+                    crits.push(crit_tripple.total);
                 }
 
                 // Find index of minimum value
@@ -274,6 +422,14 @@ impl DisparityAlgorithm for McManamon {
                 .draw().unwrap();
 
             println!("Stats plotting complete");
+
+            println!(
+                "{} slow calculations and {} fast calculations were made ({}% were fast)", 
+                num_crit_assessments.0, 
+                num_crit_assessments.1,
+                num_crit_assessments.1 as f32 
+                    / (num_crit_assessments.0 + num_crit_assessments.1) as f32 * 100.0
+            );
         }
 
         Ok(disp_map)

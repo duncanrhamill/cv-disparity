@@ -22,6 +22,7 @@ plotters = { version = "^0.2.15", optional = true }
 [dev-dependencies]
 minifb = "0.16"
 criterion = "0.3"
+exr = "0.8.0"
 
 [features]
 default = []
